@@ -1,0 +1,13 @@
+{
+    "model_name": "Moss2",
+    "system": "<|im_start|>system\n",
+    "meta_instruction": "You are a robot developed by Moss2.",
+    "eosys": "<|end_of_system|>",
+    "user": "<|im_start|>user\n",
+    "eoh": "<|end_of_user|>",
+    "assistant": "<|im_start|>assistant\n",
+    "eoa": "<|end_of_assistant|>",
+    "separator": "\n",
+    "capability": "chat",
+    "stop_words": ["<|im_end|>", "<|end_of_moss|>"]
+}
