@@ -24,6 +24,13 @@ MODULE_MAP = {
     'modeling_llama.LlamaMLP': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.llama.LlamaMLP',
 }
 
+MODULE_MAP.update({
+    'modeling_moss2.Moss2Attention':
+    f'{LMDEPLOY_PYTORCH_MODEL_PATH}.moss2.Moss2Attention',
+    'modeling_moss2.Moss2Model':
+    f'{LMDEPLOY_PYTORCH_MODEL_PATH}.moss2.Moss2Model'
+})
+
 # Falcon Models in transformer / on hub
 MODULE_MAP.update({
     'modeling_falcon.FalconAttention':
