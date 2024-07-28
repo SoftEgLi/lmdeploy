@@ -25,11 +25,35 @@ from einops import rearrange
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
 )
-from ..kernels import (alibi_paged_attention_fwd, apply_rotary_pos_emb,
+from ..kernels import (apply_rotary_pos_emb,
                        fill_kv_cache, paged_attention_fwd)
+from ..weight_loader.dist_utils import (colwise_parallelize_linear,
+                                        rowwise_parallelize_linear)
 
 
 class Moss2Attention(nn.Module):
+    def _load_weights(self, loader, rank: int, world_size: int,
+                      device: torch.device):
+        """load weights."""
+        for mod_name in ['wqkv']:
+            colwise_parallelize_linear(getattr(self, mod_name),
+                                       loader,
+                                       rank=rank,
+                                       world_size=world_size,
+                                       prefix=mod_name)
+        for mod_name in ['wo']:
+            rowwise_parallelize_linear(getattr(self, mod_name),
+                                       loader,
+                                       rank=rank,
+                                       world_size=world_size,
+                                       prefix=mod_name)
+
+    @classmethod
+    def _distribute_output_fn(cls, outputs, **kwargs):
+        """Distribution output hook."""
+        dist.all_reduce(outputs[0])
+        return outputs
+    
 
     def _contiguous_batching_forward_impl(
         self,
@@ -165,6 +189,31 @@ class Moss2Attention(nn.Module):
             world_size=world_size,
         )
 
+class Moss2MLP(nn.Module):
+
+    def _load_weights(self, loader, rank: int, world_size: int,
+                      device: torch.device):
+        """load weights."""
+        for mod_name in ['w1', 'w3']:
+            colwise_parallelize_linear(getattr(self, mod_name),
+                                       loader,
+                                       rank=rank,
+                                       world_size=world_size,
+                                       prefix=mod_name)
+        for mod_name in ['w2']:
+            rowwise_parallelize_linear(getattr(self, mod_name),
+                                       loader,
+                                       rank=rank,
+                                       world_size=world_size,
+                                       prefix=mod_name)
+
+    @classmethod
+    def _distribute_output_fn(cls, outputs, **kwargs):
+        """Distribution output hook."""
+        dist.all_reduce(outputs)
+        return outputs
+
+
 class Moss2Model(nn.Module):
 
     def _continuous_batching_forward(
@@ -239,4 +288,3 @@ class Moss2Model(nn.Module):
             use_cache,
             output_attentions,
         )
-
