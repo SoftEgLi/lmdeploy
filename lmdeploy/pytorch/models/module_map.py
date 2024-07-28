@@ -23,10 +23,12 @@ MODULE_MAP = {
     f'{LMDEPLOY_PYTORCH_MODEL_PATH}.llama.LlamaModel',
     'modeling_llama.LlamaMLP': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.llama.LlamaMLP',
 }
-
+# moss2
 MODULE_MAP.update({
     'modeling_moss2.Moss2Attention':
     f'{LMDEPLOY_PYTORCH_MODEL_PATH}.moss2.Moss2Attention',
+    'modeling_moss2.Moss2MLP':
+    f'{LMDEPLOY_PYTORCH_MODEL_PATH}.moss2.Moss2MLP',
     'modeling_moss2.Moss2Model':
     f'{LMDEPLOY_PYTORCH_MODEL_PATH}.moss2.Moss2Model'
 })
