@@ -1,7 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
 import copy
-import json
 import os
 import time
 from http import HTTPStatus
@@ -30,8 +29,10 @@ from lmdeploy.serve.openai.protocol import (  # noqa: E501
     LogProbs, ModelCard, ModelList, ModelPermission, ToolCall, TopLogprob,
     UsageInfo)
 from lmdeploy.serve.qos_engine.qos_engine import QosEngine
-from lmdeploy.tokenizer import DetokenizeState, Tokenizer
+from lmdeploy.tokenizer import DetokenizeState, Tokenizer, write_log
 from lmdeploy.utils import get_logger
+import re
+
 
 logger = get_logger('lmdeploy')
 
@@ -467,6 +468,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
             ]
         else:
             tools = [item.function.model_dump() for item in request.tools]
+    print(f'received request.messages:{request.messages[0:30]}')
     result_generator = VariableInterface.async_engine.generate(
         request.messages,
         request.session_id,
@@ -479,7 +481,6 @@ async def chat_completions_v1(request: ChatCompletionRequest,
                                      str),  # text completion for string input
         adapter_name=adapter_name,
     )
-
     def create_stream_response_json(
             index: int,
             text: str,
@@ -526,6 +527,7 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     final_token_ids = []
     final_res = None
     text = ''
+    history = None
     async for res in result_generator:
         if await raw_request.is_disconnected():
             # Abort the request if the client disconnects.
@@ -533,6 +535,8 @@ async def chat_completions_v1(request: ChatCompletionRequest,
                 request.session_id)
             return create_error_response(HTTPStatus.BAD_REQUEST,
                                          'Client disconnected')
+        if history == None:
+            history = res.history_prompts
         final_res = res
         text += res.response
         if res.token_ids:
@@ -541,22 +545,17 @@ async def chat_completions_v1(request: ChatCompletionRequest,
             final_logprobs.extend(res.logprobs)
 
     tool_calls = None
-    if request.tool_choice != 'none' and '<|plugin|>' in text:
+    if request.tool_choice != 'none' and ('<|plugin|>' in text
+                                          or '<function=' in text):
         if final_res.finish_reason == 'stop':
             final_res.finish_reason = 'tool_calls'
-        # TODO may move to generate function
-        text, action = text.split('<|action_start|><|plugin|>')
-        action = action.split('<|action_end|>'.strip())[0]
-        action = action[action.find('{'):]
         try:  # TODO add json_schema guidance to turbomind
-            action = json.loads(action)
-            action_id = [tool.function.name
-                         for tool in request.tools].index(action['name'])
+            text, action_id, name, parameters = VariableInterface.async_engine.parse_tool_response(  # noqa
+                text, request.tools)
             tool_calls = [
                 ToolCall(id=str(action_id),
-                         function=FunctionResponse(name=action['name'],
-                                                   arguments=json.dumps(
-                                                       action['parameters'])))
+                         function=FunctionResponse(name=name,
+                                                   arguments=parameters))
             ]
         except Exception as e:
             logger.error(f'Exception: {e}')
@@ -572,6 +571,13 @@ async def chat_completions_v1(request: ChatCompletionRequest,
 
     assert final_res is not None
     choices = []
+    # For anygpt
+    write_log(f'chat_completions_v1.text:{text}')
+    if model_name == 'anygpt':
+        history += text + "<eos>" + '\n'
+        text = VariableInterface.async_engine.tokenizer.post_process(text)
+        text['history'] = history
+    #
     choice_data = ChatCompletionResponseChoice(
         index=0,
         message=ChatMessage(role='assistant',

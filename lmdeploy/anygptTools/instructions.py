@@ -1,0 +1,2 @@
+from lmdeploy.anygptTools.text2other_instructions import text2other_instructions
+from lmdeploy.anygptTools.other2text_instructions import other2text_instructions

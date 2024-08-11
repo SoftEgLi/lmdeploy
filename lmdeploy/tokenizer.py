@@ -9,10 +9,68 @@ import torch
 
 from lmdeploy.utils import get_logger
 
+from lmdeploy.anygptTools.seed_llama_tokenizer import ImageTokenizer
+from lmdeploy.anygptTools.voice_clone import load_soundstorm, semantic2acoustic
+from lmdeploy.anygptTools.pre_post_process import extract_content_between_final_tags
+from lmdeploy.anygptTools.anything2token import modality_tokens_to_string
+from lmdeploy.anygptTools.prompter import *
+from datetime import datetime
+from transformers import EncodecModel, AutoProcessor
+import torchaudio
+import base64
+from einops import rearrange
+import numpy as np
+from speechtokenizer import SpeechTokenizer
+import re
+import io
+import pickle
+from PIL import Image
+
 # this file will be copied to triton server, make sure all
 # importing are starting from the package root lmdeploy
+def write_log(message):
+    if not hasattr(write_log, "now"):
+        write_log.now = datetime.now().strftime("%d %H:%M")
+    with open(f'/remote-home/clli/anygpt/log/{write_log.now}.log', 'a') as f:
+        f.write(f"{message}\n")
 
 
+image_prefix = "👀"
+speech_prefix = "🗣️"
+music_prefix = "🎶"
+audio_prefix = "👂"
+start_of_image, end_of_image = '<soim>', '<eoim>'
+start_of_speech, end_of_speech = '<sosp>', '<eosp>'
+start_of_music, end_of_music = '<somu>', '<eomu>'
+start_of_audio, end_of_audio = '<soau>', '<eoau>'
+image_vocab_size=8192
+speech_vocab_size=1024
+music_codebook_size=2048
+music_codebook_num=4
+music_vocab_size=music_codebook_size * music_codebook_num
+audio_codebook_size=1024
+audio_codebook_num=4
+audio_vocab_size=audio_codebook_size * audio_codebook_num
+modal_special_str = {
+    "image":{
+        "prefix": image_prefix,
+        "sos": start_of_image,
+        "eos": end_of_image,
+        "vocab_size": image_vocab_size
+    },
+    "speech":{
+        "prefix": speech_prefix,
+        "sos": start_of_speech,
+        "eos": end_of_speech,
+        "vocab_size": speech_vocab_size
+    },
+    "music":{
+        "prefix": music_prefix,
+        "sos": start_of_music,
+        "eos": end_of_music,
+        "vocab_size": music_vocab_size
+    },
+}
 @dataclass
 class DetokenizeState:
     """A state collection of incrementally detekenization.
@@ -665,3 +723,347 @@ class Tokenizer:
                 'than 1. Currently, it can not be used as stop words')
             return []
         return self.model.indexes_containing_token(token)
+
+
+class AnyGPTTokenizer(Tokenizer):
+    def __init__(self, text_tokenizer_path:str):
+        super().__init__(text_tokenizer_path)
+        self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        self.prompter = Prompter()
+
+        print("AnyGPTTokenizer loading")
+        # image_tokenizer
+        print("loading image tokenzier")
+        image_tokenizer_path = "/remote-home/clli/code/AnyGPT/seed_quantizer.pt"
+        print(image_tokenizer_path)
+        if image_tokenizer_path:
+            self.image_tokenizer = ImageTokenizer(model_path=image_tokenizer_path, load_diffusion=True,
+                                                  diffusion_model_path="/remote-home/clli/code/AnyGPT/stable-diffusion-2-1-unclip", device=self.device, image_size=224)
+        print("loading speech tokenzier")
+        speech_tokenizer_config, speech_tokenizer_path = "/remote-home/clli/code/AnyGPT/config.json", "/remote-home/clli/code/AnyGPT/ckpt.dev"
+        self.speech_tokenizer = SpeechTokenizer.load_from_checkpoint(speech_tokenizer_config, speech_tokenizer_path)     
+        self.speech_tokenizer.eval()
+        self.speech_tokenizer.to(device=self.device)
+        soundstorm_path = "/remote-home/clli/code/AnyGPT/speechtokenizer_soundstorm_mls.pt"
+        self.soundstorm = load_soundstorm(soundstorm_path)
+        self.soundstorm.eval()
+        self.soundstorm.to(device=self.device)
+        print("loading music tokenizer")
+        self.music_tokenizer = EncodecModel.from_pretrained("facebook/encodec_32khz")
+        self.music_tokenizer.eval()
+        self.music_tokenizer.to(device=self.device)
+        self.music_processor = AutoProcessor.from_pretrained("facebook/encodec_32khz")
+        self.music_sample_rate = 32000
+        self.music_segment_duration = 5
+        print("loading audio tokenizer")
+        self.audio_tokenizer = EncodecModel.from_pretrained("facebook/encodec_24khz")
+        self.audio_tokenizer.eval()
+        self.audio_tokenizer.to(device=self.device)
+        self.audio_processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
+        self.audio_sample_rate = 24000
+        self.audio_segment_duration = 5
+    
+    def encode_image(
+        self,
+        image_pil=None,
+    ):
+
+        # need_norm_to_1 = False
+        if image_pil is not None:
+            image_pil = pickle.loads(image_pil)
+            image_torch = self.image_tokenizer.processor(image_pil)
+
+            image_torch = image_torch.to(self.device)
+        return self.image_tokenizer.encode(image_torch)
+    
+    
+    def decode_image(self, content, negative_indices=None, guidance_scale=10):
+        print(content)
+        codes = [[int(num) for num in re.findall(r'\d+', content)]]
+        indices = torch.Tensor(codes).int().to(self.device)
+        if negative_indices is not None:
+            negative_indices = negative_indices.to(self.device)
+        image = self.image_tokenizer.decode(
+            indices,
+            negative_indices=negative_indices,
+            guidance_scale=guidance_scale,
+        )[0]
+        return image
+     
+    def encode_speech(
+        self,
+        speech_file
+    ):
+        # monophonic checking
+        wav, sr = pickle.loads(speech_file)
+        if wav.shape[0] > 1:
+            wav = wav[:1, ]
+        if sr != self.speech_tokenizer.sample_rate:
+            wav = torchaudio.functional.resample(wav, sr, self.speech_tokenizer.sample_rate)
+        wav = wav.unsqueeze(0).to(self.device)
+        # Extract discrete codes from SpeechTokenizer
+        with torch.no_grad():
+            codes = self.speech_tokenizer.encode(wav) # codes: (n_q, B, T)
+        return codes[0, 0, :]
+    
+    def decode_speech(self, content, prompt_path=None):
+        if prompt_path:
+            # get tokens of prompt
+            prompt_wav, sr = torchaudio.load(prompt_path)
+            prompt_wav = prompt_wav.to(self.device)
+            if sr != self.speech_tokenizer.sample_rate:
+                prompt_wav = torchaudio.functional.resample(prompt_wav, sr, self.speech_tokenizer.sample_rate)
+            
+            if prompt_wav.shape[0] == 2:
+                prompt_wav = prompt_wav.mean(dim=0).unsqueeze(0)
+            prompt_tokens = rearrange(self.speech_tokenizer.encode(prompt_wav.unsqueeze(0)), 'q b n -> b n q')
+        else:
+            prompt_tokens = None
+        # print(prompt_tokens)
+        write_log(f'decode_speech.content:{content}, type:{type(content)}')
+
+        semantic_codes = [[int(num) for num in re.findall(r'\d+', content)]]
+        # wav: (b, 1, t)
+        # config_dict = json.load(open('config/generate_config.json', 'r'))
+        wav = semantic2acoustic(torch.Tensor(semantic_codes).int().to(self.device), prompt_tokens, 
+                                self.soundstorm, self.speech_tokenizer, steps=4)
+        wav = wav.squeeze(0).detach().cpu()
+        return wav
+    
+    def content2rvq_codes(self, content, codebook_size, codebook_num):
+        codes = [int(code) for code in re.findall(r'\d+', content)]
+        codes = np.array([code % codebook_size for code in codes])
+        n = codes.shape[0] // codebook_num
+        # Transpose the last two dimensions to match the desired output
+        # if can't divide evenly, drop the last few codes
+        codes = codes[:n * codebook_num]
+        codes = codes.reshape(n, codebook_num).T
+        codes = np.expand_dims(codes, 0)
+        codes = np.expand_dims(codes, 0)
+        codes = torch.tensor(codes).long().to(self.device) 
+        return codes
+    def encode_music_file(audio_file, sample_rate, model, processor, device, segment_duration=-1, one_channel=True, start_from_begin=True):
+    # load the audio as a PyTorch tensor
+        waveform = pickle.loads(audio_file)
+        inputs = processor(raw_audio=waveform, sampling_rate=sample_rate, return_tensors="pt")
+        with torch.no_grad():
+            encoder_outputs = model.encode(inputs["input_values"].to(device) , inputs["padding_mask"].to(device) )
+        return encoder_outputs.audio_codes
+
+    def decode_music(self, content):
+        codes = self.content2rvq_codes(content, music_codebook_size, music_codebook_num)
+        music = self.music_tokenizer.decode(codes, [None])
+        music = music[0].squeeze(0).detach().cpu()
+        return music
+    
+    def decode_audio(self, content):
+        codes = self.content2rvq_codes(content, audio_codebook_size, audio_codebook_num)
+        audio = self.audio_tokenizer.decode(codes, [None])
+        audio = audio[0].squeeze(0).detach().cpu()
+        return audio
+    
+    def preprocess(
+        self,
+        task, instruction, 
+        image_files=None,
+        speech_files=None,
+        music_files=None
+    ):
+        image_list=[]
+        music_list=[]
+        speech_list=[]
+        for image in image_files:
+            tokens = self.encode_image(image_pil=image)[0]
+            processed_inputs = modality_tokens_to_string(tokens=tokens, modality="image")
+            # print("image: ", processed_inputs)
+            image_list.append(processed_inputs)
+        for speech in speech_files:
+            tokens = self.encode_speech(speech.strip())
+            processed_inputs = modality_tokens_to_string(tokens=tokens, modality="speech")
+            # print("speech: ", processed_inputs)
+            speech_list.append(processed_inputs)
+        for music in music_files:
+            tokens = self.encode_music_file(music, self.music_sample_rate, self.music_tokenizer, self.music_processor, 
+                                          self.device, segment_duration=self.music_segment_duration, one_channel=True, start_from_begin=True)
+            tokens = tokens[0][0]
+            processed_inputs = modality_tokens_to_string(tokens=tokens, modality="music")
+            # print("music: ", processed_inputs)
+            music_list.append(processed_inputs)
+        # 使用sft_prompt
+        prompt_seq = self.prompter.generate_insturction_prompt(task,instruction,image_list,speech_list,music_list).strip()
+        return prompt_seq
+
+    def post_process(
+        self,
+        response: str
+    ):
+        write_log(f'post_process.input:{response}')
+        text_match = re.match(r'^.*?(?=<so)', response)
+        text = None
+        if text_match:
+            text = text_match.group()
+        ret = {}
+        ret['text'] = text
+
+        file_type, file_content = None, None
+        generated_file = None
+        # print("post process")
+        modality_content = None
+        if start_of_image in response:
+            modality_content = extract_content_between_final_tags(response, tag1=start_of_image, tag2=end_of_image)
+            if modality_content == None:
+                # 当要生成的是text时，模型也会产生<sosp>这样的tokens，但没有<eosp>,此时这部分内容应视为无效。
+                return ret
+            generated_file = self.decode_image(modality_content)
+            file_type = 'image'
+            
+        elif start_of_audio in response:
+            modality_content = extract_content_between_final_tags(response, tag1=start_of_audio, tag2=end_of_audio)
+            if modality_content == None:
+                return ret
+            generated_file = self.decode_audio(modality_content)
+            file_type = 'audio'
+
+        elif start_of_music in response:
+            modality_content = extract_content_between_final_tags(response, tag1=start_of_music, tag2=end_of_music)
+            if modality_content == None:
+                return ret
+            generated_file= self.decode_music(modality_content)
+            file_type = 'music'
+
+        elif start_of_speech in response:
+            modality_content = extract_content_between_final_tags(response, tag1=start_of_speech, tag2=end_of_speech)
+            if modality_content == None:
+                return ret
+            generated_file = self.decode_speech(modality_content)
+            generated_file = (generated_file, self.speech_tokenizer.sample_rate)
+            file_type = 'speech'
+
+        if file_type != None:
+            dumps_data = pickle.dumps(generated_file)
+            file_content = base64.b64encode(dumps_data).decode('utf-8')
+            ret['file'] = {'type':file_type, 'content': file_content}
+        return ret
+    
+    def messages2prompt(self, messages):
+        
+        assert isinstance(messages, str)
+        if len(messages) > 50:
+            print(f"tokenizer.messages{messages[0:50]}")
+        else:
+            print(messages)
+
+        message = extract_content_between_final_tags(messages, '[Human]:', '<eoh>')
+        write_log(f'message2prompt.message[:100]:{message[:100]}')
+
+        inputs = message.split("|")
+        task = inputs[0].strip()
+        instruction = inputs[1].strip()
+        assert not instruction == "clear"
+        try:
+            to_modality = inputs[2].strip()
+        except:
+            to_modality = "text"
+        try:
+            voice_prompt = inputs[4].strip()
+        except IndexError:
+            voice_prompt = None  
+        if voice_prompt=="":
+            voice_prompt=None  
+        try:
+            image_files = inputs[3].split(',')
+            image_files = [base64.b64decode(f.encode('utf-8')) for f in image_files]
+        except:
+            image_files = []
+        try:
+            speech_files = inputs[5].split(',')
+            speech_files = [base64.b64decode(f.encode('utf-8')) for f in speech_files]
+        except:
+            speech_files = []
+        try:
+            music_files = inputs[6].split(',')
+            music_files = [base64.b64decode(f.encode('utf-8')) for f in music_files]
+        except:
+            music_files = []
+        if image_files == [""]:
+            image_files = []
+        if speech_files == [""]:
+            speech_files = []
+        if music_files == [""]:
+            music_files = []
+        
+        if len(speech_files) > 0 and speech_files[0].endswith("jsonl"):
+            if instruction == "eval_asr":
+                self.eval_asr(speech_files[0])
+            elif instruction == "eval_tts": 
+                self.eval_tts(speech_files[0])
+        else:
+            prompts = self.preprocess(task, instruction, image_files, speech_files, music_files)
+            # replace user query with processed prompts
+            replace_pos = messages.rfind("[Human]:") + len("[Human]:")
+            prompts = messages[:replace_pos] + prompts + "<eoh>\n" + "[MMGPT]:"
+            # for debug
+            write_log(f'prompts:{prompts}')
+        return prompts
+
+    def encode(self,
+               s: str,
+               add_bos: bool = True,
+               add_special_tokens: bool = True,
+               **kwargs):
+        print(f'tokenizer.encode.add_special_tokens{add_special_tokens}')
+        if s == '<eos>':
+            # 在encode promopt前会先encode stop_words来，此时需要特判
+            return self.model.encode(s, add_bos, add_special_tokens, **kwargs)
+        prompts = self.messages2prompt(s)
+        return self.model.encode(prompts, add_bos, add_special_tokens, **kwargs), prompts
+    def detokenize_incrementally(self,
+                                 all_input_ids: Sequence[int],
+                                 state: DetokenizeState,
+                                 skip_special_tokens: bool = True,
+                                 spaces_between_special_tokens: bool = True):
+        """Incrementally detokenize the input indexes.
+
+        Args:
+            all_input_ids (List[int]): a list of token ids. Expected to be
+                different sections of a long sequence.
+            state (DetokenizeState): an instance of DetokenizeState. Consists
+                of incrementally decoding states.
+            skip_special_tokens (bool): Whether or not to remove special tokens
+                in the decoding. Default to be True.
+            spaces_between_special_tokens (bool): Whether or not to add spaces
+                between special tokens. Default to be True.
+        Returns:
+            str: decoding output string of the current round.
+            state (DetokenizeState): an instance of DetokenizeState. Consists
+                of incrementally decoding states.
+        """
+        ret = self.model.detokenize_incrementally(
+            all_input_ids,
+            state=state,
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens)
+        write_log(f"detokenize.ret:{ret}")
+        return ret
+
+    def decode(
+        self,
+        t: Sequence[int],
+        offset: Optional[int] = None,
+        skip_special_tokens: bool = True,
+    ):
+        """De-tokenize.
+
+        Args:
+            t (List[int]): a list of token ids
+            offset (int): for incrementally decoding. Default to None, which
+                means not applied.
+            skip_special_tokens (bool): Whether or not to remove special
+                tokens in the decoding.
+        Returns:
+            str: text of decoding tokens
+        """
+        response = self.model.decode(t, offset, skip_special_tokens)
+        print(f"AnyGPT's decode is calling")
+        response = self.post_process(response)
+        return response

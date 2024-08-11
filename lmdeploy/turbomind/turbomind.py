@@ -15,7 +15,7 @@ import lmdeploy
 from lmdeploy.messages import (EngineGenerationConfig, EngineOutput,
                                ResponseType, TurbomindEngineConfig)
 from lmdeploy.model import best_match_model
-from lmdeploy.tokenizer import Tokenizer
+from lmdeploy.tokenizer import Tokenizer, AnyGPTTokenizer
 from lmdeploy.utils import get_hf_config_content, get_logger, get_model
 
 from .deploy.converter import (SUPPORTED_FORMATS,
@@ -129,18 +129,24 @@ class TurboMind:
         tp = engine_config.tp if engine_config is not None else 1
         assert ((tp & (tp - 1) == 0) and tp != 0), 'tp should be 2^n'
         self.gpu_count = tp
-
+        print(f"in turbomind.py, model_path = {model_path}, model_name = {model_name}")
         if model_source == ModelSource.WORKSPACE:
             tokenizer_model_path = osp.join(model_path, 'triton_models',
                                             'tokenizer')
-            self.tokenizer = Tokenizer(tokenizer_model_path)
+            if "AnyGPT" in model_path:
+                self.tokenizer = AnyGPTTokenizer(tokenizer_model_path)
+            else:
+                self.tokenizer = Tokenizer(tokenizer_model_path)
             self.model_comm = self._from_workspace(model_path=model_path,
                                                    engine_config=engine_config)
         else:
             if not osp.exists(model_path):
                 model_path = get_model(model_path, engine_config.download_dir,
                                        engine_config.revision)
-            self.tokenizer = Tokenizer(model_path)
+            if "AnyGPT" in model_path:
+                self.tokenizer = AnyGPTTokenizer(model_path)
+            else:
+                self.tokenizer = Tokenizer(model_path)
             self.model_comm = self._from_hf(model_source=model_source,
                                             model_path=model_path,
                                             engine_config=engine_config)

@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
 import dataclasses
+import json
 import os
 import random
 from contextlib import asynccontextmanager
@@ -16,9 +17,8 @@ from lmdeploy.model import MODELS, ChatTemplateConfig, best_match_model
 from lmdeploy.serve.utils import LogitsMixin, _get_event_loop
 from lmdeploy.tokenizer import DetokenizeState
 from lmdeploy.utils import _get_and_verify_max_len, _stop_words, get_logger
-
+from lmdeploy.tokenizer import write_log
 logger = get_logger('lmdeploy')
-
 
 def get_model_name_from_workspace_model(model_dir: str):
     """Get model name from workspace model."""
@@ -69,6 +69,8 @@ class GenOut:
     finish_reason: Optional[Literal['stop', 'length']] = None
     token_ids: List[int] = None
     logprobs: List[Dict[int, float]] = None
+    history_prompts:str = None
+
 
 
 class Session:
@@ -174,7 +176,8 @@ class AsyncEngine(LogitsMixin):
         elif chat_template_config.model_name is None:
             chat_template_config.model_name = chat_template_name
         self.chat_template = chat_template_config.chat_template
-
+        self.chat_template_name = chat_template_name
+        print(f"chat_template_name:{chat_template_name}")
         # prevent bc
         for k in list(kwargs.keys()):
             if hasattr(chat_template_config, k):
@@ -513,6 +516,7 @@ class AsyncEngine(LogitsMixin):
                                 adapter_name: str,
                                 tools: Optional[List[object]] = None,
                                 **kwargs):
+                                
         if do_preprocess:
             # use adapter's chat template if possible
             chat_template = self.chat_template
@@ -521,8 +525,13 @@ class AsyncEngine(LogitsMixin):
             prompt = chat_template.messages2prompt(prompt,
                                                    sequence_start,
                                                    tools=tools)
-        input_ids = self.tokenizer.encode(prompt, add_bos=sequence_start)
-        return {'prompt': prompt, 'input_ids': input_ids}
+        print(f"get_prompt_input.prompt = {prompt[:30]}")
+        if self.chat_template_name == 'anygpt':
+            input_ids, history = self.tokenizer.encode(prompt, add_bos=sequence_start)
+            return {'prompt': prompt, 'input_ids': input_ids, 'history': history}
+        else:
+            input_ids = self.tokenizer.encode(prompt, add_bos=sequence_start)
+            return {'prompt': prompt, 'input_ids': input_ids}
 
     async def generate(
             self,
@@ -571,7 +580,7 @@ class AsyncEngine(LogitsMixin):
                            f'Fallback to 1')
             gen_config.n = 1
         prompt = messages
-
+        
         prompt_input = await self._get_prompt_input(prompt,
                                                     do_preprocess,
                                                     sequence_start,
@@ -579,6 +588,9 @@ class AsyncEngine(LogitsMixin):
                                                     tools=tools)
         prompt = prompt_input['prompt']
         input_ids = prompt_input['input_ids']
+        history = None
+        if 'history' in prompt_input.keys():
+            history = prompt_input['history']
         finish_reason = None
         logger.info(f'prompt={prompt!r}, '
                     f'gen_config={gen_config}, '
@@ -646,7 +658,7 @@ class AsyncEngine(LogitsMixin):
                     # input token len, gen token len
                     yield GenOut(response, self.id2step[str(session_id)],
                                  len(input_ids), tokens, finish_reason, res,
-                                 logprobs)
+                                 logprobs, history)
 
                 finish_reason = 'length' \
                     if tokens >= gen_config.max_new_tokens else 'stop'
@@ -664,6 +676,28 @@ class AsyncEngine(LogitsMixin):
                 # TODO modify pytorch or turbomind api
                 if self.backend == 'pytorch' and sequence_end:
                     await self.end_session(session_id)
+
+    def parse_tool_response(self, text, tools, **kwargs):
+        """Parse model response containing tool information.
+
+        Args:
+            text(str): model response in string format
+            tools(List): tools from user request
+        """
+        if '<|plugin|>' in text:  # internlm2
+            text, action = text.split('<|action_start|><|plugin|>')
+            action = action.split('<|action_end|>'.strip())[0]
+            action = action[action.find('{'):]
+            action = json.loads(action)
+            name, parameters = action['name'], json.dumps(action['parameters'])
+        elif '<function=' in text:  # llama3.1
+            action, _ = text.split('</function>')
+            parameters = action[action.find('{'):]
+            name = action.split('<function=')[1].split('>{')[0]
+        else:
+            raise RuntimeError(f'Unexpected model response: {text}')
+        action_id = [tool.function.name for tool in tools].index(name)
+        return text, action_id, name, parameters
 
     def chat(self,
              prompt: str,
@@ -715,3 +749,4 @@ class AsyncEngine(LogitsMixin):
         session.history.append((session._prompt, resp.text))
 
         return session
+

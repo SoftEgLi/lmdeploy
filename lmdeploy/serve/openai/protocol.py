@@ -146,7 +146,7 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     """Chat messages."""
     role: str
-    content: str
+    content: Union[str,dict]
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
