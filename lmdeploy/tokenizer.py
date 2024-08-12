@@ -729,6 +729,7 @@ class AnyGPTTokenizer(Tokenizer):
     def __init__(self, text_tokenizer_path:str):
         super().__init__(text_tokenizer_path)
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
         self.prompter = Prompter()
 
         print("AnyGPTTokenizer loading")
@@ -773,16 +774,15 @@ class AnyGPTTokenizer(Tokenizer):
             image_pil = pickle.loads(image_pil)
             image_torch = self.image_tokenizer.processor(image_pil)
 
-            image_torch = image_torch.to(self.device)
+            image_torch = image_torch.to(self.image_tokenizer.device)
         return self.image_tokenizer.encode(image_torch)
     
     
     def decode_image(self, content, negative_indices=None, guidance_scale=10):
-        print(content)
         codes = [[int(num) for num in re.findall(r'\d+', content)]]
-        indices = torch.Tensor(codes).int().to(self.device)
+        indices = torch.Tensor(codes).int().to(self.image_tokenizer.device)
         if negative_indices is not None:
-            negative_indices = negative_indices.to(self.device)
+            negative_indices = negative_indices.to(self.image_tokenizer.device)
         image = self.image_tokenizer.decode(
             indices,
             negative_indices=negative_indices,
@@ -800,7 +800,7 @@ class AnyGPTTokenizer(Tokenizer):
             wav = wav[:1, ]
         if sr != self.speech_tokenizer.sample_rate:
             wav = torchaudio.functional.resample(wav, sr, self.speech_tokenizer.sample_rate)
-        wav = wav.unsqueeze(0).to(self.device)
+        wav = wav.unsqueeze(0).to(self.speech_tokenizer.device)
         # Extract discrete codes from SpeechTokenizer
         with torch.no_grad():
             codes = self.speech_tokenizer.encode(wav) # codes: (n_q, B, T)
@@ -810,7 +810,7 @@ class AnyGPTTokenizer(Tokenizer):
         if prompt_path:
             # get tokens of prompt
             prompt_wav, sr = torchaudio.load(prompt_path)
-            prompt_wav = prompt_wav.to(self.device)
+            prompt_wav = prompt_wav.to(self.speech_tokenizer.device)
             if sr != self.speech_tokenizer.sample_rate:
                 prompt_wav = torchaudio.functional.resample(prompt_wav, sr, self.speech_tokenizer.sample_rate)
             
@@ -825,12 +825,12 @@ class AnyGPTTokenizer(Tokenizer):
         semantic_codes = [[int(num) for num in re.findall(r'\d+', content)]]
         # wav: (b, 1, t)
         # config_dict = json.load(open('config/generate_config.json', 'r'))
-        wav = semantic2acoustic(torch.Tensor(semantic_codes).int().to(self.device), prompt_tokens, 
+        wav = semantic2acoustic(torch.Tensor(semantic_codes).int().to(self.speech_tokenizer.device), prompt_tokens, 
                                 self.soundstorm, self.speech_tokenizer, steps=4)
         wav = wav.squeeze(0).detach().cpu()
         return wav
     
-    def content2rvq_codes(self, content, codebook_size, codebook_num):
+    def content2rvq_codes(self, content, codebook_size, codebook_num, tokenizer):
         codes = [int(code) for code in re.findall(r'\d+', content)]
         codes = np.array([code % codebook_size for code in codes])
         n = codes.shape[0] // codebook_num
@@ -840,24 +840,24 @@ class AnyGPTTokenizer(Tokenizer):
         codes = codes.reshape(n, codebook_num).T
         codes = np.expand_dims(codes, 0)
         codes = np.expand_dims(codes, 0)
-        codes = torch.tensor(codes).long().to(self.device) 
+        codes = torch.tensor(codes).long().to(self.tokenizer.device) 
         return codes
-    def encode_music_file(audio_file, sample_rate, model, processor, device, segment_duration=-1, one_channel=True, start_from_begin=True):
+    def encode_music_file(self, audio_file, sample_rate, model, processor, device, segment_duration=-1, one_channel=True, start_from_begin=True):
     # load the audio as a PyTorch tensor
         waveform = pickle.loads(audio_file)
         inputs = processor(raw_audio=waveform, sampling_rate=sample_rate, return_tensors="pt")
         with torch.no_grad():
-            encoder_outputs = model.encode(inputs["input_values"].to(device) , inputs["padding_mask"].to(device) )
+            encoder_outputs = model.encode(inputs["input_values"].to(self.music_tokenizer.device) , inputs["padding_mask"].to(device) )
         return encoder_outputs.audio_codes
 
     def decode_music(self, content):
-        codes = self.content2rvq_codes(content, music_codebook_size, music_codebook_num)
+        codes = self.content2rvq_codes(content, music_codebook_size, music_codebook_num, self.music_tokenizer)
         music = self.music_tokenizer.decode(codes, [None])
         music = music[0].squeeze(0).detach().cpu()
         return music
     
     def decode_audio(self, content):
-        codes = self.content2rvq_codes(content, audio_codebook_size, audio_codebook_num)
+        codes = self.content2rvq_codes(content, audio_codebook_size, audio_codebook_num, self.audio_tokenizer)
         audio = self.audio_tokenizer.decode(codes, [None])
         audio = audio[0].squeeze(0).detach().cpu()
         return audio
@@ -1038,13 +1038,11 @@ class AnyGPTTokenizer(Tokenizer):
             state (DetokenizeState): an instance of DetokenizeState. Consists
                 of incrementally decoding states.
         """
-        ret = self.model.detokenize_incrementally(
+        return self.model.detokenize_incrementally(
             all_input_ids,
             state=state,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens)
-        write_log(f"detokenize.ret:{ret}")
-        return ret
 
     def decode(
         self,
